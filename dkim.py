@@ -28,7 +28,7 @@ app = Flask(__name__)
 def split_key_by_val(key):
     # Split the record into two separate TXT records
     name = key.split()[0]
-    content_1 = "%s %s" % (key.split()[1], key.split()[2])
+    content_1 = f"{key.split()[1]} {key.split()[2]}"
     content_2 = key.split()[3]
 
     # Return the two separate TXT records as a dictionary
