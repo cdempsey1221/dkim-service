@@ -30,9 +30,15 @@ def split_key_by_val(key):
     name = key.split()[0]
     content_1 = f"{key.split()[1]} {key.split()[2]}"
     content_2 = key.split()[3]
+    content_3 = key.split()[4]
+
+    print('name: %s \n content1: %s \n content2: %s\n content3 %s\n' % (name, content_1, content_2, content_3) )
+
+    split_key_json = {'record1': f"{name} {content_1} {content_2}", 'record2': f"{name} TXT {content_3}"}
+    print(split_key_json)
 
     # Return the two separate TXT records as a dictionary
-    return {'record1': f"{name} TXT {content_1}", 'record2': f"{name} TXT {content_2}"}
+    return split_key_json
 
 @app.route('/split_by_value', methods=['POST'])
 def split_by_value():
