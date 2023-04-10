@@ -1,7 +1,7 @@
 """
 DKIM Record Splitter REST Service
 
-This Flask application defines a single endpoint '/split_dkim' that accepts a POST request
+This Flask application defines a single endpoint '/split_by_value' that accepts a POST request
 with a JSON payload containing a DKIM record. The application then splits the DKIM record
 into two separate TXT records, and returns the two separate TXT records as a JSON response.
 
@@ -32,7 +32,7 @@ def split_key_by_val(key):
     content_2 = key.split()[3]
 
     # Return the two separate TXT records as a dictionary
-    return {'record1': name + " TXT " + content_1, 'record2': name + " TXT " + content_2}
+    return {'record1': f"{name} TXT {content_1}", 'record2': f"{name} TXT {content_2}"}
 
 @app.route('/split_by_value', methods=['POST'])
 def split_by_value():
