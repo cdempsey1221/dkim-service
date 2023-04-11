@@ -32,10 +32,11 @@ def split_key_by_val(key):
     content_2 = key.split()[3]
     content_3 = key.split()[4]
 
-    print('name: %s \n content1: %s \n content2: %s\n content3 %s\n' % (name, content_1, content_2, content_3) )
+    app.logger.debug('name: %s \n content1: %s \n content2: %s\n content3 %s\n' % (name, content_1, content_2, content_3) )
 
     split_key_json = {'record1': f"{name} {content_1} {content_2}", 'record2': f"{name} TXT {content_3}"}
-    print(split_key_json)
+    
+    app.logger.debug(split_key_json)
 
     # Return the two separate TXT records as a dictionary
     return split_key_json
