@@ -72,5 +72,9 @@ def dkim_key_type():
 def healthz():
     return jsonify({"status": "ok"}), 200
 
+@app.route('/readyz', methods=['GET'])
+def readyz():
+    return jsonify({"status": "ready"}), 200
+
 if __name__ == '__main__':
     app.run(debug=True)
