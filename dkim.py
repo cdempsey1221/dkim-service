@@ -41,6 +41,14 @@ def split_key_by_val(key):
     # Return the two separate TXT records as a dictionary
     return split_key_json
 
+def parse_key_type(record):
+    for token in record.split():
+        for tag in token.split(';'):
+            tag = tag.strip()
+            if tag.lower().startswith('k='):
+                return tag[2:].strip().upper()
+    return 'RSA'  # RFC 6376 §3.3 default
+
 @app.route('/split_by_value', methods=['POST'])
 def split_by_value():
     # Get the DKIM record from the JSON payload
@@ -51,6 +59,14 @@ def split_by_value():
 
     # Return the two separate TXT records as a JSON response
     return jsonify(result)
+
+@app.route('/dkim_key_type', methods=['POST'])
+def dkim_key_type():
+    data = request.get_json()
+    if not data or 'dkim_record' not in data:
+        return jsonify({'error': 'missing dkim_record'}), 400
+    key_type = parse_key_type(data['dkim_record'])
+    return jsonify({'key_type': key_type}), 200
 
 @app.route('/healthz', methods=['GET'])
 def healthz():
