@@ -52,5 +52,9 @@ def split_by_value():
     # Return the two separate TXT records as a JSON response
     return jsonify(result)
 
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    return jsonify({"status": "ok"}), 200
+
 if __name__ == '__main__':
     app.run(debug=True)
