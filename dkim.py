@@ -49,6 +49,16 @@ def parse_key_type(record):
                 return tag[2:].strip().upper()
     return 'RSA'  # RFC 6376 §3.3 default
 
+def is_valid_dkim(record):
+    tags = {}
+    for token in record.split():
+        for part in token.split(';'):
+            part = part.strip()
+            if '=' in part:
+                key, _, val = part.partition('=')
+                tags[key.strip().lower()] = val.strip()
+    return tags.get('v', '').upper() == 'DKIM1' and 'p' in tags
+
 @app.route('/split_by_value', methods=['POST'])
 def split_by_value():
     # Get the DKIM record from the JSON payload
@@ -67,6 +77,14 @@ def dkim_key_type():
         return jsonify({'error': 'missing dkim_record'}), 400
     key_type = parse_key_type(data['dkim_record'])
     return jsonify({'key_type': key_type}), 200
+
+@app.route('/validate_dkim', methods=['POST'])
+def validate_dkim():
+    data = request.get_json()
+    if not data or 'dkim_record' not in data:
+        return jsonify({'error': 'missing dkim_record'}), 400
+    valid = is_valid_dkim(data['dkim_record'])
+    return jsonify({'valid': valid}), 200
 
 @app.route('/healthz', methods=['GET'])
 def healthz():
