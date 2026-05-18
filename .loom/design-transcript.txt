@@ -1,0 +1,149 @@
+=== prompt ===
+You are the loom DESIGN phase. Your input is the findings document from the discover phase; your output is a design that the execute phase will implement.
+
+Task goal:
+add a GET /readyz endpoint that returns 200 with {"status":"ready"}, with a passing test
+
+Branch: loom/01KRXYFK8ZXH0Q0S269499B58H
+
+=== begin findings.md ===
+# Findings
+
+## Goal restated
+
+Add a `GET /readyz` endpoint to the Flask application that returns HTTP 200 with the JSON body `{"status": "ready"}`, and add a passing test for it.
+
+## Relevant code locations
+
+- `dkim.py` — The Flask application; defines all route handlers (`/split_by_value`, `/healthz`) and the `split_key_by_val` helper
+- `tests/test_healthz.py` — Test class for the `/healthz` endpoint; the direct template for the new `/readyz` test
+- `tests/test_split_key_by_val.py` — Test for the helper function; secondary reference for test style
+- `requirements.txt` — Pinned dependencies (Flask 2.2.3, Werkzeug 2.2.3, no test framework listed — `unittest` from stdlib is used)
+- `gunicorn_config.py` — Production server config; no routing logic
+- `Dockerfile` — Container definition; exposes port 5000, sets `FLASK_APP=dkim.py`
+
+## Current behaviour
+
+`dkim.py` registers two routes on the `app` Flask instance:
+
+1. `POST /split_by_value` — parses a JSON body with `dkim_record`, calls `split_key_by_val()`, returns a two-record JSON object.
+2. `GET /healthz` — returns `jsonify({"status": "ok"}), 200`. This is the direct analogue for the new endpoint.
+
+Tests use Python `unittest` with Flask's built-in test client:
+
+```python
+self.client = app.test_client()
+response = self.client.get('/healthz')
+self.assertEqual(response.status_code, 200)
+body = json.loads(response.data)
+self.assertEqual(body, {"status": "ok"})
+```
+
+There is no `pytest` or other test runner configuration; tests are plain `unittest.TestCase` subclasses importable via `python -m unittest discover`.
+
+## Constraints and assumptions
+
+- **Framework**: Flask 2.2.3 (pinned). Use `@app.route` decorator and `jsonify` — consistent with existing routes.
+- **Return convention**: Route handlers return `jsonify({...}), <status_code>`. The `/healthz` handler returns an explicit `200`; the new endpoint should do the same for parity.
+- **JSON body**: Must be exactly `{"status": "ready"}` — the goal specifies the string `"ready"` (vs `"ok"` used by `/healthz`).
+- **Test file placement**: All tests live in `tests/`. The new test file should follow the naming pattern `tests/test_readyz.py` (matching `test_healthz.py`).
+- **Test imports**: Tests import directly from `dkim` (not a package path), so the test runner must be invoked from the repo root. No `__init__.py` files exist under `tests/`.
+- **Test class structure**: One `TestCase` subclass per file, `setUp` creates `app.test_client()`, individual `test_*` methods assert status code and JSON body separately (two tests in `test_healthz.py`).
+- **No logging**: The `/healthz` handler has no `app.logger` calls; the new endpoint should match that minimal style.
+- **HTTP method**: `GET` only — consistent with `/healthz` which also restricts to `methods=['GET']`.
+
+## Risks and open questions
+
+- **Test discovery**: There is no `pytest.ini`, `setup.cfg`, or `tox.ini`. It is unclear how tests are currently run in CI (if any). The design phase should ensure the new test file is discoverable by whatever runner is in use. `python -m unittest discover tests` will find it if named `test_readyz.py`.
+- **Naming ambiguity — `readyz` vs `ready`**: Kubernetes convention uses `/readyz` (with z); the goal spec uses that spelling. No risk of collision with existing routes.
+- **Single vs. two test methods**: `test_healthz.py` uses two separate test methods (one for status code, one for body). The design phase should decide whether to mirror that exactly or consolidate — mirroring is the safer, most consistent choice.
+- **gunicorn vs flask run**: The `Dockerfile` uses `flask run`, not gunicorn, despite `gunicorn_config.py` existing. This is irrelevant to the endpoint change but worth noting — the new route will be served correctly either way.
+- **No authentication/middleware**: No auth, rate-limiting, or middleware is applied to any route. The new endpoint needs none.
+=== end findings.md ===
+
+Your job: produce a single markdown design document. Do not write, modify, or move any files; this phase is read-only. You may Read/Glob/Grep further if the findings missed something. Do not run tests or builds.
+
+Respond with only the document. Structure:
+
+# Design
+
+## Approach
+- short prose summary of how you'll satisfy the goal
+
+## Changes by file
+- one bullet per file you intend to change or create, with a one-line note
+
+## Step-by-step plan
+1. ...
+2. ...
+3. ...
+
+## Test plan
+- which existing tests cover this, and what new tests (if any) are required
+
+## Risks and open questions
+- anything the operator should resolve before execute runs
+
+Aim for 100-300 lines. Be specific. The execute phase will follow this plan literally; ambiguity becomes bugs.
+
+=== response (exit 0, duration 15.484s) ===
+# Design
+
+## Approach
+
+Add a `GET /readyz` route to `dkim.py` that returns `jsonify({"status": "ready"}), 200`, mirroring the existing `/healthz` handler exactly except for the path and status string. Add a new test file `tests/test_readyz.py` that mirrors the structure of `tests/test_healthz.py` with two test methods: one asserting HTTP 200, one asserting the JSON body equals `{"status": "ready"}`.
+
+## Changes by file
+
+- `dkim.py` — add a `GET /readyz` route handler returning `jsonify({"status": "ready"}), 200`
+- `tests/test_readyz.py` — create new test file with a `TestCase` subclass covering status code and response body
+
+## Step-by-step plan
+
+1. Open `dkim.py` and locate the `/healthz` route handler (the reference implementation).
+2. Immediately after the `/healthz` handler, insert a new route:
+   ```python
+   @app.route('/readyz', methods=['GET'])
+   def readyz():
+       return jsonify({"status": "ready"}), 200
+   ```
+   No imports need to change — `jsonify` is already imported via `from flask import Flask, request, jsonify` (or equivalent).
+3. Create `tests/test_readyz.py` with the following content, modelled directly on `tests/test_healthz.py`:
+   ```python
+   import json
+   import unittest
+   from dkim import app
+
+   class TestReadyz(unittest.TestCase):
+       def setUp(self):
+           self.client = app.test_client()
+
+       def test_status_code(self):
+           response = self.client.get('/readyz')
+           self.assertEqual(response.status_code, 200)
+
+       def test_response_body(self):
+           response = self.client.get('/readyz')
+           body = json.loads(response.data)
+           self.assertEqual(body, {"status": "ready"})
+
+   if __name__ == '__main__':
+       unittest.main()
+   ```
+4. Verify the test is discoverable: `python -m unittest discover tests` from the repo root will find any `test_*.py` file, so `test_readyz.py` qualifies automatically.
+
+## Test plan
+
+- **Existing tests**: `tests/test_healthz.py` and `tests/test_split_key_by_val.py` must continue to pass unchanged — the new route does not touch any existing handler.
+- **New tests in `tests/test_readyz.py`**:
+  - `test_status_code` — GET `/readyz` returns HTTP 200
+  - `test_response_body` — GET `/readyz` returns JSON body exactly equal to `{"status": "ready"}`
+- Run all tests with `python -m unittest discover tests` from the repo root to confirm nothing regresses.
+
+## Risks and open questions
+
+- **Flask import line**: The execute phase must confirm the exact existing import line in `dkim.py` (e.g., `from flask import Flask, request, jsonify`) to ensure `jsonify` is already imported and no import change is needed. If `jsonify` is not imported, add it.
+- **Placement of new route**: Inserting after `/healthz` is the most logical location; the execute phase should confirm the end of the `/healthz` handler to find the exact insertion point without disrupting surrounding code.
+- **No `__init__.py` in `tests/`**: Confirmed by findings — do not add one; it is not needed and could break relative imports elsewhere.
+- **CI runner**: The findings note no `pytest.ini` or CI config is visible. The `if __name__ == '__main__': unittest.main()` guard in the new file is harmless but not required; it is included for consistency with potential future direct invocation.
+
