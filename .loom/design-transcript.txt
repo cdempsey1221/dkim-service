@@ -2,63 +2,136 @@
 You are the loom DESIGN phase. Your input is the findings document from the discover phase; your output is a design that the execute phase will implement.
 
 Task goal:
-add a GET /readyz endpoint that returns 200 with {"status":"ready"}, with a passing test
+add an endpoint that checks if a given payload is an actual valid DKIM record, with a passing test
 
-Branch: loom/01KRXYFK8ZXH0Q0S269499B58H
+Branch: loom/01KRY98SW3A0N7KY3N8BM746TH
 
 === begin findings.md ===
 # Findings
 
 ## Goal restated
 
-Add a `GET /readyz` endpoint to the Flask application that returns HTTP 200 with the JSON body `{"status": "ready"}`, and add a passing test for it.
+Add a new endpoint to the Flask DKIM service that accepts a DKIM record payload and returns whether the record is a valid DKIM record, with at least one passing test.
+
+---
 
 ## Relevant code locations
 
-- `dkim.py` — The Flask application; defines all route handlers (`/split_by_value`, `/healthz`) and the `split_key_by_val` helper
-- `tests/test_healthz.py` — Test class for the `/healthz` endpoint; the direct template for the new `/readyz` test
-- `tests/test_split_key_by_val.py` — Test for the helper function; secondary reference for test style
-- `requirements.txt` — Pinned dependencies (Flask 2.2.3, Werkzeug 2.2.3, no test framework listed — `unittest` from stdlib is used)
-- `gunicorn_config.py` — Production server config; no routing logic
-- `Dockerfile` — Container definition; exposes port 5000, sets `FLASK_APP=dkim.py`
+- `dkim.py` — the sole Flask application; defines all four existing routes and two helper functions
+- `tests/test_dkim_key_type.py` — pytest-style tests for `POST /dkim_key_type`; most recent test file
+- `tests/test_healthz.py` — unittest-style tests for `GET /healthz`
+- `tests/test_readyz.py` — unittest-style tests for `GET /readyz`
+- `tests/test_split_key_by_val.py` — unittest-style test of the `split_key_by_val` helper directly
+- `requirements.txt` — Flask 2.2.3 plus transitive deps; no DKIM parsing library (e.g., `dkimpy`) present
+
+---
 
 ## Current behaviour
 
-`dkim.py` registers two routes on the `app` Flask instance:
+### Routes in `dkim.py`
 
-1. `POST /split_by_value` — parses a JSON body with `dkim_record`, calls `split_key_by_val()`, returns a two-record JSON object.
-2. `GET /healthz` — returns `jsonify({"status": "ok"}), 200`. This is the direct analogue for the new endpoint.
+| Method | Path | Handler | Returns |
+|--------|------|---------|---------|
+| `POST` | `/split_by_value` | `split_by_value()` | `200` + `{"record1": ..., "record2": ...}` |
+| `POST` | `/dkim_key_type` | `dkim_key_type()` | `200` + `{"key_type": "RSA"}`, or `400` + `{"error": "missing dkim_record"}` |
+| `GET` | `/healthz` | `healthz()` | `200` + `{"status": "ok"}` |
+| `GET` | `/readyz` | `readyz()` | `200` + `{"status": "ready"}` |
 
-Tests use Python `unittest` with Flask's built-in test client:
+### Helper functions
 
-```python
-self.client = app.test_client()
-response = self.client.get('/healthz')
-self.assertEqual(response.status_code, 200)
-body = json.loads(response.data)
-self.assertEqual(body, {"status": "ok"})
+**`split_key_by_val(key)`** (`dkim.py:28`) — splits a whitespace-tokenised DKIM record string into two TXT records by positional indexing. No validation.
+
+**`parse_key_type(record)`** (`dkim.py:44`) — iterates whitespace-split tokens, then splits each by `;`, looks for a tag beginning with `k=`, and returns the uppercased value. Defaults to `'RSA'` (RFC 6376 §3.3 default) when the tag is absent.
+
+### Input format established by existing tests
+
+All POST endpoints receive `Content-Type: application/json` with a body keyed on `dkim_record`, e.g.:
+
+```
+"big-email._domainkey.example.com TXT v=DKIM1; k=rsa; p=ABCD 6000"
 ```
 
-There is no `pytest` or other test runner configuration; tests are plain `unittest.TestCase` subclasses importable via `python -m unittest discover`.
+The format is `<selector>._domainkey.<domain> TXT <dkim-tag-list> [ttl]`.
+
+### Error handling convention
+
+Only `/dkim_key_type` has input validation today. The pattern is:
+```python
+if not data or 'dkim_record' not in data:
+    return jsonify({'error': 'missing dkim_record'}), 400
+```
+`/split_by_value` has no guard; a missing key raises an unhandled `KeyError`.
+
+---
 
 ## Constraints and assumptions
 
-- **Framework**: Flask 2.2.3 (pinned). Use `@app.route` decorator and `jsonify` — consistent with existing routes.
-- **Return convention**: Route handlers return `jsonify({...}), <status_code>`. The `/healthz` handler returns an explicit `200`; the new endpoint should do the same for parity.
-- **JSON body**: Must be exactly `{"status": "ready"}` — the goal specifies the string `"ready"` (vs `"ok"` used by `/healthz`).
-- **Test file placement**: All tests live in `tests/`. The new test file should follow the naming pattern `tests/test_readyz.py` (matching `test_healthz.py`).
-- **Test imports**: Tests import directly from `dkim` (not a package path), so the test runner must be invoked from the repo root. No `__init__.py` files exist under `tests/`.
-- **Test class structure**: One `TestCase` subclass per file, `setUp` creates `app.test_client()`, individual `test_*` methods assert status code and JSON body separately (two tests in `test_healthz.py`).
-- **No logging**: The `/healthz` handler has no `app.logger` calls; the new endpoint should match that minimal style.
-- **HTTP method**: `GET` only — consistent with `/healthz` which also restricts to `methods=['GET']`.
+### Language and framework
+- Python 3.9, Flask 2.2.3 (pinned). No type hints, no dataclasses in use.
+- Single file app (`dkim.py`); all routes are registered directly on the `app` object.
+- `from flask import Flask, request, jsonify` already covers everything needed for a new POST route.
+
+### No DKIM library available
+`requirements.txt` contains only Flask and its transitive dependencies (click, colorama, itsdangerous, Jinja2, MarkupSafe, Werkzeug). There is no `dkimpy`, `dnspython`, or similar library. Validation must be implemented manually, or a new dependency must be added and pinned to `requirements.txt`.
+
+### DKIM record validity (RFC 6376 §3.6.1)
+A minimal syntactically valid DKIM public-key TXT record must:
+1. Contain a `v=DKIM1` tag (required, must be first if present per RFC)
+2. Contain a `p=` tag (required; value is base64-encoded public key, or empty to signal revocation)
+
+Optional tags the endpoint may or may not check: `k=` (key type, default `rsa`), `h=` (hash algorithms), `t=` (flags), `s=` (service types), `n=` (notes).
+
+The existing record strings in tests also include a leading `<name> TXT` prefix and an optional trailing TTL integer — the tag-parsing logic must account for tokens that are not `key=value` pairs.
+
+### Testing conventions — mixed styles in repo
+- `tests/test_healthz.py` and `tests/test_readyz.py`: `unittest.TestCase` subclass with `setUp` using `app.test_client()`.
+- `tests/test_split_key_by_val.py`: `unittest.TestCase` testing a helper function directly.
+- `tests/test_dkim_key_type.py` (most recent): **pytest** with a `@pytest.fixture` named `client`, using `app.config['TESTING'] = True` and `app.test_client()`. Assertions via plain `assert`.
+
+The design phase must choose one style. The most recent test file uses pytest; `requirements.txt` does not list pytest explicitly but it is commonly available in the test environment (the `.gitignore` includes `.pytest_cache/`).
+
+### Import pattern for tests
+All test files import directly: `from dkim import app`. No `conftest.py` exists; the pytest fixture in `test_dkim_key_type.py` is defined inline.
+
+### Error response schema
+All errors use `{"error": "<message>"}` with HTTP `400`. This is the established contract.
+
+### No `tests/__init__.py`
+Tests directory has no `__init__.py`; discovery runs as `python -m unittest discover tests` or `pytest tests/`.
+
+---
 
 ## Risks and open questions
 
-- **Test discovery**: There is no `pytest.ini`, `setup.cfg`, or `tox.ini`. It is unclear how tests are currently run in CI (if any). The design phase should ensure the new test file is discoverable by whatever runner is in use. `python -m unittest discover tests` will find it if named `test_readyz.py`.
-- **Naming ambiguity — `readyz` vs `ready`**: Kubernetes convention uses `/readyz` (with z); the goal spec uses that spelling. No risk of collision with existing routes.
-- **Single vs. two test methods**: `test_healthz.py` uses two separate test methods (one for status code, one for body). The design phase should decide whether to mirror that exactly or consolidate — mirroring is the safer, most consistent choice.
-- **gunicorn vs flask run**: The `Dockerfile` uses `flask run`, not gunicorn, despite `gunicorn_config.py` existing. This is irrelevant to the endpoint change but worth noting — the new route will be served correctly either way.
-- **No authentication/middleware**: No auth, rate-limiting, or middleware is applied to any route. The new endpoint needs none.
+### 1. Definition of "valid" — depth of validation
+The goal says "actual valid DKIM record" but does not specify depth. Options from shallow to deep:
+- **Syntactic only**: check that `v=DKIM1` and `p=` tags are present and non-absent.
+- **Plus base64**: also verify that the `p=` value (if non-empty) is valid base64-encoded data.
+- **Plus key parsing**: also verify the decoded bytes represent a parseable RSA/Ed25519 public key (would require `cryptography` library).
+
+The codebase currently does no cryptographic operations. Adding the `cryptography` package is the only way to validate the actual key bytes. The design phase should decide whether "valid" means structurally present tags or also semantically correct key material.
+
+### 2. Response shape on valid vs invalid input
+Two common patterns:
+- `200` with `{"valid": true|false}` for both outcomes (treats validity as data)
+- `200` with `{"valid": true}` for valid; `422` or `400` with `{"error": "..."}` for invalid (treats invalidity as an error)
+
+The existing endpoints do not have a boolean-result pattern. The design phase must pick one.
+
+### 3. Response body on valid case
+If `{"valid": true}` is chosen, should additional parsed fields be returned (e.g., `{"valid": true, "key_type": "RSA"}`), or is a bare boolean sufficient?
+
+### 4. Endpoint naming
+No strict naming convention exists. The two POST endpoints are `/split_by_value` (verb phrase) and `/dkim_key_type` (noun phrase). Candidates: `/validate_dkim`, `/dkim_validate`, `/dkim_valid`. The design phase should choose.
+
+### 5. Handling the `<name> TXT` prefix and trailing TTL
+The record strings used in all existing tests have the format `<name> TXT <tags> [ttl]`. The tag-parsing logic in `parse_key_type` relies on this implicitly (it skips non-`k=` tokens). A validation function must similarly tolerate leading `<name>`, `TXT`, and trailing TTL tokens without misidentifying them as DKIM tags. Whether records *without* this wrapper (raw tag lists like `v=DKIM1; p=ABC`) should also be accepted is an open question.
+
+### 6. Empty `p=` (revoked key)
+RFC 6376 allows `p=` with an empty value to signal key revocation. An empty `p=` is structurally valid per the RFC but the key is unusable. Whether this endpoint should return `{"valid": true}` or `{"valid": false}` for a revoked key must be decided.
+
+### 7. Test file style decision
+The repo mixes `unittest` and `pytest`. The last endpoint test (`test_dkim_key_type.py`) uses pytest. Following that most-recent precedent is the natural choice, but the design phase should confirm.
 === end findings.md ===
 
 Your job: produce a single markdown design document. Do not write, modify, or move any files; this phase is read-only. You may Read/Glob/Grep further if the findings missed something. Do not run tests or builds.
@@ -86,64 +159,92 @@ Respond with only the document. Structure:
 
 Aim for 100-300 lines. Be specific. The execute phase will follow this plan literally; ambiguity becomes bugs.
 
-=== response (exit 0, duration 15.484s) ===
+=== response (exit 0, duration 31.292s) ===
 # Design
 
 ## Approach
 
-Add a `GET /readyz` route to `dkim.py` that returns `jsonify({"status": "ready"}), 200`, mirroring the existing `/healthz` handler exactly except for the path and status string. Add a new test file `tests/test_readyz.py` that mirrors the structure of `tests/test_healthz.py` with two test methods: one asserting HTTP 200, one asserting the JSON body equals `{"status": "ready"}`.
+Add a `POST /validate_dkim` endpoint that accepts the same `{"dkim_record": "..."}` JSON body used by all existing POST endpoints and returns `{"valid": true}` or `{"valid": false}`. Validity is defined as **syntactic only**: the tag list within the record must contain both a `v=DKIM1` tag and a `p=` tag (whose value may be empty — revoked keys are considered structurally valid per RFC 6376). No cryptographic parsing; no new dependencies.
+
+A small private helper `is_valid_dkim(record)` extracts DKIM tags from the record string using the same token-splitting pattern already used by `parse_key_type`, then checks for the two required tags. This keeps all logic self-contained in `dkim.py` with no changes to `requirements.txt`.
+
+The response shape uses `{"valid": true|false}` for both outcomes (HTTP 200 in both cases), treating validity as a data result rather than an error condition. Missing/malformed input returns `{"error": "missing dkim_record"}` with HTTP 400, consistent with `/dkim_key_type`.
+
+Tests follow the pytest style of `tests/test_dkim_key_type.py` (most recent precedent).
+
+---
 
 ## Changes by file
 
-- `dkim.py` — add a `GET /readyz` route handler returning `jsonify({"status": "ready"}), 200`
-- `tests/test_readyz.py` — create new test file with a `TestCase` subclass covering status code and response body
+- **`dkim.py`** — add `is_valid_dkim(record)` helper and `POST /validate_dkim` route handler
+- **`tests/test_validate_dkim.py`** — new pytest test file covering valid, invalid, revoked-key, and missing-input cases
+
+---
 
 ## Step-by-step plan
 
-1. Open `dkim.py` and locate the `/healthz` route handler (the reference implementation).
-2. Immediately after the `/healthz` handler, insert a new route:
+1. **Add `is_valid_dkim(record)` helper to `dkim.py`** (insert after `parse_key_type`, before the first `@app.route`).
+
+   Logic:
    ```python
-   @app.route('/readyz', methods=['GET'])
-   def readyz():
-       return jsonify({"status": "ready"}), 200
+   def is_valid_dkim(record):
+       tags = {}
+       for token in record.split():
+           for part in token.split(';'):
+               part = part.strip()
+               if '=' in part:
+                   key, _, val = part.partition('=')
+                   tags[key.strip().lower()] = val.strip()
+       return tags.get('v', '').upper() == 'DKIM1' and 'p' in tags
    ```
-   No imports need to change — `jsonify` is already imported via `from flask import Flask, request, jsonify` (or equivalent).
-3. Create `tests/test_readyz.py` with the following content, modelled directly on `tests/test_healthz.py`:
+   - Splits on whitespace first (handles leading `<name> TXT` and trailing TTL tokens).
+   - Splits each whitespace token on `;` (handles semicolon-separated tag lists like `v=DKIM1; k=rsa; p=ABC`).
+   - Uses `partition('=')` so a bare `p=` (empty value, revoked key) still sets `tags['p']`.
+   - Returns `True` only when both `v=DKIM1` and `p=` are present; `False` otherwise.
+
+2. **Add `POST /validate_dkim` route to `dkim.py`** (append after the `/dkim_key_type` route):
+
    ```python
-   import json
-   import unittest
-   from dkim import app
-
-   class TestReadyz(unittest.TestCase):
-       def setUp(self):
-           self.client = app.test_client()
-
-       def test_status_code(self):
-           response = self.client.get('/readyz')
-           self.assertEqual(response.status_code, 200)
-
-       def test_response_body(self):
-           response = self.client.get('/readyz')
-           body = json.loads(response.data)
-           self.assertEqual(body, {"status": "ready"})
-
-   if __name__ == '__main__':
-       unittest.main()
+   @app.route('/validate_dkim', methods=['POST'])
+   def validate_dkim():
+       data = request.get_json()
+       if not data or 'dkim_record' not in data:
+           return jsonify({'error': 'missing dkim_record'}), 400
+       valid = is_valid_dkim(data['dkim_record'])
+       return jsonify({'valid': valid}), 200
    ```
-4. Verify the test is discoverable: `python -m unittest discover tests` from the repo root will find any `test_*.py` file, so `test_readyz.py` qualifies automatically.
+
+3. **Create `tests/test_validate_dkim.py`** with pytest style matching `test_dkim_key_type.py`:
+
+   - Inline `@pytest.fixture` named `client` (identical to the one in `test_dkim_key_type.py`)
+   - Test cases listed in the Test plan below
+
+---
 
 ## Test plan
 
-- **Existing tests**: `tests/test_healthz.py` and `tests/test_split_key_by_val.py` must continue to pass unchanged — the new route does not touch any existing handler.
-- **New tests in `tests/test_readyz.py`**:
-  - `test_status_code` — GET `/readyz` returns HTTP 200
-  - `test_response_body` — GET `/readyz` returns JSON body exactly equal to `{"status": "ready"}`
-- Run all tests with `python -m unittest discover tests` from the repo root to confirm nothing regresses.
+**Existing tests**: no changes; all four existing test files continue to pass unchanged.
+
+**New tests in `tests/test_validate_dkim.py`**:
+
+| Test function | Input `dkim_record` | Expected response |
+|---|---|---|
+| `test_valid_rsa_record` | `"big-email._domainkey.example.com TXT v=DKIM1; k=rsa; p=ABCD 6000"` | `200`, `{"valid": true}` |
+| `test_valid_record_no_k_tag` | `"big-email._domainkey.example.com TXT v=DKIM1; p=76E629F05F 6000"` | `200`, `{"valid": true}` (k= is optional) |
+| `test_invalid_missing_v_tag` | `"big-email._domainkey.example.com TXT k=rsa; p=ABCD 6000"` | `200`, `{"valid": false}` |
+| `test_invalid_missing_p_tag` | `"big-email._domainkey.example.com TXT v=DKIM1; k=rsa 6000"` | `200`, `{"valid": false}` |
+| `test_valid_revoked_key` | `"big-email._domainkey.example.com TXT v=DKIM1; p= 6000"` | `200`, `{"valid": true}` (empty p= is RFC-valid) |
+| `test_missing_dkim_record_key_returns_400` | `{}` (no `dkim_record` key) | `400`, `{"error": "missing dkim_record"}` |
+
+---
 
 ## Risks and open questions
 
-- **Flask import line**: The execute phase must confirm the exact existing import line in `dkim.py` (e.g., `from flask import Flask, request, jsonify`) to ensure `jsonify` is already imported and no import change is needed. If `jsonify` is not imported, add it.
-- **Placement of new route**: Inserting after `/healthz` is the most logical location; the execute phase should confirm the end of the `/healthz` handler to find the exact insertion point without disrupting surrounding code.
-- **No `__init__.py` in `tests/`**: Confirmed by findings — do not add one; it is not needed and could break relative imports elsewhere.
-- **CI runner**: The findings note no `pytest.ini` or CI config is visible. The `if __name__ == '__main__': unittest.main()` guard in the new file is harmless but not required; it is included for consistency with potential future direct invocation.
+1. **Revoked key (`p=` empty) returns `true`**: The design treats an empty `p=` as structurally valid (RFC 6376 §3.5 allows it). If the operator considers a revoked/unusable key "not valid" for this service's purposes, change the helper to require `tags.get('p') != ''`.
+
+2. **`v=DKIM1` must be first tag (RFC strict)**: RFC 6376 §3.5 says "the `v=` tag MUST be the first tag". The current helper checks for its presence anywhere in the tag list, not positional order. This is consistent with how all other tag parsing works in this codebase. Tighten if strict RFC compliance is required.
+
+3. **Records without the `<name> TXT` prefix**: The helper tolerates raw tag-only strings (e.g., `"v=DKIM1; p=ABC"`) because the token-splitting logic is tag-agnostic. This is a superset of the existing test format and should not cause problems.
+
+4. **No new dependency on `requirements.txt`**: The design intentionally avoids adding `cryptography` or `dkimpy`. If the operator wants actual public key material validation (decoded base64 parses as a valid RSA/Ed25519 key), the design must be extended and `requirements.txt` updated.
 
