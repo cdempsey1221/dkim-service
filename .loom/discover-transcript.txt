@@ -1,0 +1,108 @@
+=== prompt ===
+You are the loom DISCOVER phase. Loom is a phase-gated development harness; your output feeds the design phase that follows.
+
+Task goal:
+add a /dkim_key_type endpoint that returns 200 if the json contains the dkim record with key type (e.g., RSA) and it can be parsed from the payload, with a passing test
+
+Working directory: the current directory is a git worktree of the target repository. The branch is loom/01KRY15G5F817GCMJ7YNPD45X6.
+
+Your job: produce a thorough, read-only analysis of the repository as it relates to the goal. Investigate using Read, Glob, Grep, and the allowlisted git/inspection commands. Do not write, modify, or move any files. Do not run tests or builds.
+
+Respond with a single markdown document (no preamble, no closing remarks — just the document). Structure:
+
+# Findings
+
+## Goal restated
+
+## Relevant code locations
+- one bullet per file/directory, with a one-line note on what it does
+
+## Current behaviour
+- how the relevant code works today
+
+## Constraints and assumptions
+- conventions, types, error handling, tests, build, anything the design phase must respect
+
+## Risks and open questions
+- ambiguities the design phase or operator should resolve
+
+Aim for 150-400 lines. Be specific (file paths, function names). Quote short snippets only when needed.
+
+=== response (exit 0, duration 1m40.998s) ===
+# Findings
+
+## Goal restated
+
+Add a `POST /dkim_key_type` endpoint (or `GET`, TBD) that accepts a JSON payload containing a DKIM record, parses the key type from it (e.g., `RSA`), and returns HTTP 200 with the key type when it can be successfully extracted. A passing test is required.
+
+---
+
+## Relevant code locations
+
+- `dkim.py` — The single Flask application file; all routes and business logic live here (61 lines). This is where the new endpoint and any helper function must be added.
+- `tests/test_healthz.py` — Tests for `GET /healthz`; the structural template for HTTP-level endpoint tests (uses `app.test_client()`, `json.loads(response.data)`, `assertEqual`).
+- `tests/test_split_key_by_val.py` — Tests for the `split_key_by_val` helper; the template for unit-testing standalone parsing functions (imports the function directly from `dkim`).
+- `requirements.txt` — Pins Flask 2.2.3 and its deps; no additional parsing libraries present.
+
+---
+
+## Current behaviour
+
+**Endpoints today:**
+
+1. `POST /split_by_value` (`dkim.py:44–53`)  
+   Reads `data['dkim_record']` from `request.get_json()`, passes it to `split_key_by_val()`, returns `jsonify(result)` with implicit 200.
+
+2. `GET /healthz` (`dkim.py:55–57`)  
+   Returns `jsonify({"status": "ok"}), 200` unconditionally.
+
+**Parsing helper — `split_key_by_val(key)` (`dkim.py:28–42`):**  
+Tokenises the record with `key.split()` (whitespace) and accesses tokens by fixed index:
+```
+[0] name          big-email._domainkey.example.com
+[1] record type   TXT
+[2] dkim prefix   v=DKIM1;
+[3] public key    p=76E629F05F...
+[4] ttl           6000
+```
+Returns `{'record1': ..., 'record2': ...}`.
+
+**Existing record format used in tests:**
+```
+big-email._domainkey.example.com TXT v=DKIM1; p=76E629F05F709EF665853333EEC3F5ADE69A2362BECE40658267AB2FC3CB6CBE 6000
+```
+Notably, this record has **no `k=` tag**. Per RFC 6376, the default key type when `k=` is absent is `rsa`.
+
+---
+
+## Constraints and assumptions
+
+- **Language / framework**: Python 3.9, Flask 2.2.3. No new dependencies should be needed; `re` from the standard library is sufficient for tag parsing.
+- **Route registration pattern**: `@app.route('/path', methods=['METHOD'])` decorator on a function directly in `dkim.py`.
+- **JSON input convention**: `request.get_json()` then `data['dkim_record']`. The new endpoint should follow the same pattern.
+- **Response convention**: `jsonify(dict), status_code`. The 200 path should return the parsed key type in a JSON dict; the field name is unspecified (likely `{"key_type": "rsa"}`).
+- **Test file naming**: one file per feature under `tests/`, named `test_<feature>.py`.
+- **Test structure**: `unittest.TestCase` subclass, `setUp` creates `self.client = app.test_client()`, assertions use `self.assertEqual`. HTTP tests call `self.client.post(...)` or `self.client.get(...)`.
+- **Import pattern in tests**: `from dkim import app` for HTTP tests; `from dkim import function_name` for unit tests.
+- **No error-handling convention established**: `split_by_value` does no error handling — a bad payload raises an unhandled exception. The design phase must decide whether `dkim_key_type` should return 400 on bad input or follow the same silent-crash pattern.
+- **DKIM tag format**: Tags within the record body follow `tag=value` separated by `;` (RFC 6376). The key type tag is `k=` and its value for RSA is `rsa` (lowercase in the wire format).
+- **No existing regex/tag parser**: there is no shared utility; any new tag parsing logic must be written inline or as a new helper.
+
+---
+
+## Risks and open questions
+
+1. **HTTP method**: The goal says "returns 200 if the json contains the dkim record" but doesn't specify `GET` vs `POST`. Given JSON body parsing, `POST` is the natural choice (consistent with `/split_by_value`), but this should be confirmed.
+
+2. **`k=` tag absent → default RSA?** The canonical DKIM test record in this repo has no `k=` tag. RFC 6376 §3.3 defaults to `rsa` when `k=` is omitted. The new endpoint must decide: (a) default to `"rsa"` when absent, (b) return 400/error, or (c) document that it only works on records that explicitly carry `k=`.
+
+3. **Case sensitivity of key type**: RFC 6376 says `k=rsa`; should the response normalise to uppercase `"RSA"` (as the task description implies) or echo the wire value `"rsa"`?
+
+4. **Record format variability**: The existing record string is a flat whitespace-separated line (`name TXT <tags> ttl`). Real DKIM TXT records may have tags in different orders or combined differently (e.g., `v=DKIM1; k=rsa; p=...` as one token or spread). The parser must handle semicolon-separated tags within the body portion rather than relying on fixed token indices.
+
+5. **What constitutes "parseable"?**: The task says return 200 "if … it can be parsed from the payload." This implies a 4xx (likely 400) when parsing fails (missing `dkim_record` key, malformed tag string, etc.). The exact error response shape is unspecified.
+
+6. **Response payload shape**: Not specified. Likely `{"key_type": "RSA"}` or `{"key_type": "rsa"}` — the design phase should fix this before implementation.
+
+7. **Test coverage scope**: Should the test cover (a) happy path only, (b) the missing-`k=`-defaults-to-RSA case, (c) a bad-payload 400 case? At minimum one passing test is required by the goal; the design phase should enumerate all required test cases.
+
