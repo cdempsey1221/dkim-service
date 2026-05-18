@@ -41,6 +41,22 @@ def split_key_by_val(key):
     # Return the two separate TXT records as a dictionary
     return split_key_json
 
+def get_key_type(record):
+    parts = record.split()
+    try:
+        txt_index = next(i for i, p in enumerate(parts) if p.upper() == 'TXT')
+    except StopIteration:
+        txt_index = -1
+    tag_string = ' '.join(parts[txt_index + 1:])
+    tag_parts = tag_string.rsplit(None, 1)
+    if len(tag_parts) == 2 and tag_parts[1].isdigit():
+        tag_string = tag_parts[0]
+    for tag in tag_string.split(';'):
+        tag = tag.strip()
+        if tag.lower().startswith('k='):
+            return tag[2:].strip().upper()
+    return 'RSA'
+
 @app.route('/split_by_value', methods=['POST'])
 def split_by_value():
     # Get the DKIM record from the JSON payload
@@ -55,6 +71,15 @@ def split_by_value():
 @app.route('/healthz', methods=['GET'])
 def healthz():
     return jsonify({"status": "ok"}), 200
+
+@app.route('/dkim_key_type', methods=['POST'])
+def dkim_key_type():
+    data = request.get_json()
+    if not data or 'dkim_record' not in data:
+        return jsonify({"error": "missing dkim_record"}), 400
+    key_type = get_key_type(data['dkim_record'])
+    app.logger.debug('key_type: %s' % key_type)
+    return jsonify({"key_type": key_type}), 200
 
 if __name__ == '__main__':
     app.run(debug=True)
