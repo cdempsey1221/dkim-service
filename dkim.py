@@ -25,39 +25,46 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+def _parse_dkim_record(record):
+    tokens = record.split()
+    tags = []
+    for token in tokens:
+        for part in token.split(';'):
+            part = part.strip()
+            if '=' in part:
+                k, _, v = part.partition('=')
+                tags.append((k.strip().lower(), v.strip()))
+    return tokens, tags
+
 def split_key_by_val(key):
-    # Split the record into two separate TXT records
-    name = key.split()[0]
-    content_1 = f"{key.split()[1]} {key.split()[2]}"
-    content_2 = key.split()[3]
-    content_3 = key.split()[4]
+    tokens, _ = _parse_dkim_record(key)
+    name = tokens[0]
+    content_1 = f"{tokens[1]} {tokens[2]}"
+    content_2 = tokens[3]
+    content_3 = tokens[4]
 
     app.logger.debug('name: %s \n content1: %s \n content2: %s\n content3 %s\n' % (name, content_1, content_2, content_3) )
 
     split_key_json = {'record1': f"{name} {content_1} {content_2}", 'record2': f"{name} TXT {content_3}"}
-    
+
     app.logger.debug(split_key_json)
 
     # Return the two separate TXT records as a dictionary
     return split_key_json
 
 def parse_key_type(record):
-    for token in record.split():
-        for tag in token.split(';'):
-            tag = tag.strip()
-            if tag.lower().startswith('k='):
-                return tag[2:].strip().upper()
+    _, tags = _parse_dkim_record(record)
+    for key, value in tags:
+        if key == 'k':
+            return value.upper()
     return 'RSA'  # RFC 6376 §3.3 default
 
 def is_valid_dkim(record):
-    tags = {}
-    for token in record.split():
-        for part in token.split(';'):
-            part = part.strip()
-            if '=' in part:
-                key, _, val = part.partition('=')
-                tags[key.strip().lower()] = val.strip()
-    return tags.get('v', '').upper() == 'DKIM1' and 'p' in tags
+    _, tags = _parse_dkim_record(record)
+    tag_map = {}
+    for key, value in tags:
+        tag_map[key] = value
+    return tag_map.get('v', '').upper() == 'DKIM1' and 'p' in tag_map
 
 @app.route('/split_by_value', methods=['POST'])
 def split_by_value():
