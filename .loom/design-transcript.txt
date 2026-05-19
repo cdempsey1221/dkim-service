@@ -2,63 +2,233 @@
 You are the loom DESIGN phase. Your input is the findings document from the discover phase; your output is a design that the execute phase will implement.
 
 Task goal:
-add a GET /readyz endpoint that returns 200 with {"status":"ready"}, with a passing test
+Refactor the DKIM tag-list parsing logic in dkim.py: split_key_by_val, parse_key_type, and is_valid_dkim each parse tags independently. Extract a single private helper they all share. Preserve current behavior and all existing tests.
 
-Branch: loom/01KRXYFK8ZXH0Q0S269499B58H
+Branch: loom/01KRZBHDPMPB2AQKQ2HX4X3C72
 
 === begin findings.md ===
 # Findings
 
 ## Goal restated
-
-Add a `GET /readyz` endpoint to the Flask application that returns HTTP 200 with the JSON body `{"status": "ready"}`, and add a passing test for it.
+- The requested refactor scope is explicitly **all three** functions in `dkim.py`: `split_key_by_val`, `parse_key_type`, and `is_valid_dkim`.
+- The target change is to extract **one shared private helper** for DKIM tag-list parsing and have all three functions use it.
+- The design must preserve current behavior, including edge-case behavior, and keep existing tests passing unchanged.
+- This is a DISCOVER-phase analysis only: no file edits, no test runs, no build runs.
 
 ## Relevant code locations
-
-- `dkim.py` — The Flask application; defines all route handlers (`/split_by_value`, `/healthz`) and the `split_key_by_val` helper
-- `tests/test_healthz.py` — Test class for the `/healthz` endpoint; the direct template for the new `/readyz` test
-- `tests/test_split_key_by_val.py` — Test for the helper function; secondary reference for test style
-- `requirements.txt` — Pinned dependencies (Flask 2.2.3, Werkzeug 2.2.3, no test framework listed — `unittest` from stdlib is used)
-- `gunicorn_config.py` — Production server config; no routing logic
-- `Dockerfile` — Container definition; exposes port 5000, sets `FLASK_APP=dkim.py`
+- `dkim.py`
+  - Single Flask app module containing endpoints and the three relevant functions (`split_key_by_val`, `parse_key_type`, `is_valid_dkim`).
+- `tests/test_split_key_by_val.py`
+  - Direct unit test of `split_key_by_val` output shape and exact strings.
+- `tests/test_dkim_key_type.py`
+  - API tests for `/dkim_key_type`, which indirectly assert `parse_key_type` behavior.
+- `tests/test_validate_dkim.py`
+  - API tests for `/validate_dkim`, which indirectly assert `is_valid_dkim` behavior.
+- `tests/test_healthz.py`
+  - Health endpoint coverage; not directly related to DKIM parsing but part of regression surface.
+- `tests/test_readyz.py`
+  - Readiness endpoint coverage; not directly related but same module import/runtime path.
+- `Dockerfile`
+  - Runtime baseline and packaging assumptions; pins base image to `python:3.9-alpine`.
+- `requirements.txt`
+  - Dependency pin list; file is UTF-16 LE encoded with BOM, relevant to tooling assumptions.
+- `gunicorn_config.py`
+  - Deployment config, not directly tied to parsing logic but indicates service execution expectations.
+- `README.md`
+  - Minimal project description only.
 
 ## Current behaviour
+- `split_key_by_val(key)` in `dkim.py:28-42`:
+  - Splits the entire record by whitespace using repeated `key.split()` calls.
+  - Assumes at least five tokens exist.
+  - Extracts:
+    - `name = key.split()[0]`
+    - `content_1 = f"{key.split()[1]} {key.split()[2]}"`
+    - `content_2 = key.split()[3]`
+    - `content_3 = key.split()[4]`
+  - Returns:
+    - `record1 = "{name} {content_1} {content_2}"`
+    - `record2 = "{name} TXT {content_3}"`
+  - For the tested input, `record1` contains the DKIM tag-list prefix up to the `p=` value, and `record2` contains only the trailing token (`6000`) as separate TXT record content.
+  - It does not parse tags semantically; it slices by positional tokens.
+  - It logs intermediate pieces through `app.logger.debug`.
+  - It has no input validation or exception handling.
+  - If fewer than 5 whitespace tokens are present, current behavior is an uncaught `IndexError`.
+  - Multiple spaces are normalized by `split()` behavior.
+  - Quoted TXT content is not specially handled.
 
-`dkim.py` registers two routes on the `app` Flask instance:
+- `parse_key_type(record)` in `dkim.py:44-50`:
+  - Parses by iterating `record.split()` tokens.
+  - Further splits each token by `;` (`token.split(';')`).
+  - Trims each segment with `strip()`.
+  - Checks `tag.lower().startswith('k=')`.
+  - Returns first matched `k` value as uppercase (`tag[2:].strip().upper()`).
+  - If no `k=` tag is found, defaults to `'RSA'` (comment references RFC 6376 §3.3).
+  - First-match wins by traversal order.
+  - Empty `k=` would return empty string uppercased (still empty), though no test currently asserts this.
+  - Case-insensitive detection for key name only via `lower().startswith('k=')`.
+  - No explicit guard for malformed `record` type.
+  - If `record` is non-string, behavior depends on object supporting `.split()`.
 
-1. `POST /split_by_value` — parses a JSON body with `dkim_record`, calls `split_key_by_val()`, returns a two-record JSON object.
-2. `GET /healthz` — returns `jsonify({"status": "ok"}), 200`. This is the direct analogue for the new endpoint.
+- `is_valid_dkim(record)` in `dkim.py:52-60`:
+  - Creates `tags = {}`.
+  - Iterates whitespace tokens from `record.split()`.
+  - Splits each token by `;`.
+  - Trims each part.
+  - For parts containing `'='`, uses `partition('=')` and stores:
+    - key normalized to lowercase and stripped.
+    - value stripped.
+  - Later duplicate tags overwrite earlier values because dict assignment is last-write-wins.
+  - Validation condition is:
+    - `tags.get('v', '').upper() == 'DKIM1'`
+    - and `'p' in tags`
+  - Important: it validates only **presence** of `p`, not non-empty `p`.
+  - Therefore revoked-key pattern `p=` (empty value) is treated as valid.
+  - Ignores unknown tags.
+  - Ignores parts without `=` (e.g., bare tokens).
+  - Accepts mixed-case `v=dkim1` due to `.upper()`.
+  - No explicit type guard for non-string inputs.
 
-Tests use Python `unittest` with Flask's built-in test client:
+- Endpoint behavior tied to these functions:
+  - `/dkim_key_type` (`dkim.py:73-79`) returns `400 {"error":"missing dkim_record"}` when missing payload/key.
+  - `/validate_dkim` (`dkim.py:81-87`) same missing-key handling.
+  - `/split_by_value` (`dkim.py:62-71`) does **not** perform missing-key guard; directly indexes `data['dkim_record']`.
+  - Refactor target is function-level parsing logic, but endpoint-level behavior should remain unchanged unless explicitly requested.
 
-```python
-self.client = app.test_client()
-response = self.client.get('/healthz')
-self.assertEqual(response.status_code, 200)
-body = json.loads(response.data)
-self.assertEqual(body, {"status": "ok"})
-```
+- Test-covered behavior from `tests/test_dkim_key_type.py`:
+  - Explicit `k=rsa` returns `{"key_type":"RSA"}`.
+  - Missing `k` defaults to `{"key_type":"RSA"}`.
+  - Missing `dkim_record` key yields 400 error JSON.
+  - Tests do not cover non-RSA key types, mixed-case keys, duplicate tags, malformed records.
 
-There is no `pytest` or other test runner configuration; tests are plain `unittest.TestCase` subclasses importable via `python -m unittest discover`.
+- Test-covered behavior from `tests/test_validate_dkim.py`:
+  - Valid with `v=DKIM1` and `p=ABCD` -> `{"valid": True}`.
+  - Valid with no `k` tag -> `{"valid": True}`.
+  - Invalid missing `v` -> `{"valid": False}`.
+  - Invalid missing `p` -> `{"valid": False}`.
+  - Valid revoked key `p=` (empty) -> `{"valid": True}`.
+  - Missing `dkim_record` key -> 400 error JSON.
+
+- Test-covered behavior from `tests/test_split_key_by_val.py`:
+  - Asserts exact output dict with exact string formatting for a canonical sample record.
+  - Does not test malformed token counts, extra tags, quoted fields, or alternate spacing.
+
+- Inferred parsing overlap today:
+  - `parse_key_type` and `is_valid_dkim` both independently parse semicolon-delimited key-value tags out whitespace tokens.
+  - `split_key_by_val` currently does not parse into a map but still independently tokenizes the DKIM record, including tag-list segment assumptions.
+  - The goal’s required shared helper implies centralizing this repeated token/tag processing so all three consume the same parsed structure or normalized tokenization pathway.
 
 ## Constraints and assumptions
+- Scope constraint from task statement:
+  - The refactor must include `split_key_by_val`, `parse_key_type`, and `is_valid_dkim`.
+  - The shared helper should be private (Python convention likely `_helper_name` in `dkim.py`).
+  - Behavior preservation is mandatory.
 
-- **Framework**: Flask 2.2.3 (pinned). Use `@app.route` decorator and `jsonify` — consistent with existing routes.
-- **Return convention**: Route handlers return `jsonify({...}), <status_code>`. The `/healthz` handler returns an explicit `200`; the new endpoint should do the same for parity.
-- **JSON body**: Must be exactly `{"status": "ready"}` — the goal specifies the string `"ready"` (vs `"ok"` used by `/healthz`).
-- **Test file placement**: All tests live in `tests/`. The new test file should follow the naming pattern `tests/test_readyz.py` (matching `test_healthz.py`).
-- **Test imports**: Tests import directly from `dkim` (not a package path), so the test runner must be invoked from the repo root. No `__init__.py` files exist under `tests/`.
-- **Test class structure**: One `TestCase` subclass per file, `setUp` creates `app.test_client()`, individual `test_*` methods assert status code and JSON body separately (two tests in `test_healthz.py`).
-- **No logging**: The `/healthz` handler has no `app.logger` calls; the new endpoint should match that minimal style.
-- **HTTP method**: `GET` only — consistent with `/healthz` which also restricts to `methods=['GET']`.
+- Runtime baseline:
+  - `Dockerfile:2` uses `FROM python:3.9-alpine`.
+  - Design should stay compatible with Python 3.9 syntax and stdlib behavior.
+  - No use of Python >=3.10-only syntax (e.g., `match`) if aiming for runtime parity.
+
+- Dependency baseline:
+  - `requirements.txt` pins Flask/Werkzeug stack around Flask 2.2.3.
+  - The file bytes show UTF-16 LE BOM encoding (`ff fe`) and null-separated characters.
+  - Tooling or edits touching `requirements.txt` would need encoding care, though this refactor need not touch it.
+
+- Project structure constraint:
+  - Single-module app (`dkim.py`) with tests importing directly from it.
+  - Adding helper within same module avoids import-surface changes.
+
+- API compatibility constraints from tests:
+  - `/dkim_key_type` and `/validate_dkim` status codes and JSON keys must remain identical.
+  - `parse_key_type` default must remain `'RSA'` when `k` missing.
+  - `is_valid_dkim` must keep current “`p` presence only” semantics, including `p=` accepted.
+  - `split_key_by_val` output string composition must match existing expected string exactly for tested case.
+
+- Behavioral compatibility likely expected even where untested:
+  - `is_valid_dkim` currently lowercases tag names and uppercases `v` compare.
+  - `parse_key_type` currently returns first encountered `k=` according to scan order.
+  - `is_valid_dkim` currently lets later duplicate tags overwrite earlier ones.
+  - Any helper extraction should preserve these traversal/override semantics unless tests are added intentionally.
+
+- Error-handling constraints:
+  - Current code does not catch malformed-record exceptions in `split_key_by_val`.
+  - Refactor should not silently change exception behavior unless intentionally accepted.
+  - `/split_by_value` currently lacks guard for missing `dkim_record`; not in requested goal.
+
+- Test framework conventions:
+  - Mixed `pytest` and `unittest` style in `tests/`.
+  - No explicit linting/type-check config present in repository root.
+  - No CI config files discovered at top two levels.
+  - Design should assume tests are the main behavioral contract.
+
+- Naming/style assumptions:
+  - Existing code is simple function-level style without classes for parsing.
+  - Private helper naming with leading underscore is conventional and aligns with requested “private helper.”
+
+- Performance constraints:
+  - Current functions repeatedly call `split()` and nested loops; helper extraction can reduce repeated parsing work.
+  - Input sizes are likely small DKIM TXT strings; performance is secondary to behavior fidelity.
 
 ## Risks and open questions
+- Primary regression risk:
+  - Changing `split_key_by_val` from fixed positional token slicing to helper-based tag parsing may subtly alter returned formatting if not carefully constrained.
+  - Example risk areas: spacing normalization, semicolon retention, token ordering in `record1`.
 
-- **Test discovery**: There is no `pytest.ini`, `setup.cfg`, or `tox.ini`. It is unclear how tests are currently run in CI (if any). The design phase should ensure the new test file is discoverable by whatever runner is in use. `python -m unittest discover tests` will find it if named `test_readyz.py`.
-- **Naming ambiguity — `readyz` vs `ready`**: Kubernetes convention uses `/readyz` (with z); the goal spec uses that spelling. No risk of collision with existing routes.
-- **Single vs. two test methods**: `test_healthz.py` uses two separate test methods (one for status code, one for body). The design phase should decide whether to mirror that exactly or consolidate — mirroring is the safer, most consistent choice.
-- **gunicorn vs flask run**: The `Dockerfile` uses `flask run`, not gunicorn, despite `gunicorn_config.py` existing. This is irrelevant to the endpoint change but worth noting — the new route will be served correctly either way.
-- **No authentication/middleware**: No auth, rate-limiting, or middleware is applied to any route. The new endpoint needs none.
+- Traversal-order risk:
+  - `parse_key_type` returns first `k=` match today.
+  - A helper that materializes dict-only tags could lose first-match semantics unless it also preserves ordered tag stream.
+  - `is_valid_dkim` currently effectively uses last value for duplicate tags because of dict overwrite.
+  - Shared helper must support both behaviors or encode one without changing outcomes.
+
+- Edge-case tokenization risk:
+  - Existing logic splits on whitespace globally.
+  - Any helper that tokenizes differently (e.g., preserving quoted strings) may change behavior for odd inputs.
+  - Since task is behavior-preserving, helper should likely keep current `str.split()` tokenization semantics.
+
+- Minimal-scope design choice:
+  - The safest shared primitive appears to be a helper yielding normalized tag key/value pairs in encounter order (and possibly raw token list), allowing each caller to preserve its own semantics.
+  - Overly opinionated helper (e.g., enforcing required tags) would couple behavior and risk regressions.
+
+- `split_key_by_val` coupling question (now decided by goal):
+  - Not an open scope question: this function is in scope and should consume the shared helper per task.
+  - Open implementation question is only **how** to integrate helper without changing output/exception behavior.
+
+- Exception behavior ambiguity:
+  - There are no tests for malformed `split_key_by_val` inputs.
+  - If helper adds bounds checks and returns graceful output, that would likely be a behavior change.
+  - Design phase should explicitly choose whether to preserve raw `IndexError` semantics (safer for “preserve behavior”).
+
+- Untested DKIM variants:
+  - No tests for `k=ed25519`, uppercase `K=`, spaced forms like `k = rsa`, duplicate `k` tags, or repeated `v/p`.
+  - Refactor should avoid speculative normalization improvements unless accompanied by explicit test changes (not requested).
+
+- Endpoint discrepancy risk:
+  - `/split_by_value` currently does not validate request body like other endpoints.
+  - Refactor touching shared parsing should avoid accidentally introducing endpoint-level validation changes.
+
+- Logging side effects:
+  - `split_key_by_val` logs specific intermediate variables.
+  - If helper abstraction removes/changes variables, debug logs may change; tests do not assert logs, but operational debugging could be affected.
+
+- File encoding risk outside scope:
+  - `requirements.txt` UTF-16 LE is unusual; unrelated edits can corrupt it if treated as UTF-8.
+  - Design/implementation should avoid touching unrelated files.
+
+- Build/runtime assumptions:
+  - Python 3.9-alpine means C-extension build deps are installed transiently in Docker build.
+  - No change required, but any proposed modernization should remain 3.9-compatible.
+
+- Operator/design clarification worth deciding upfront:
+  - Preferred helper return shape:
+    - Option A: ordered list of parsed `(key, value)` tags plus raw segments.
+    - Option B: dict of final tags plus optional ordered list for first-match callers.
+    - Option C: lightweight iterator/generator over parsed tag entries.
+  - Choice should be based on exact behavior preservation for both first-match (`parse_key_type`) and last-write (`is_valid_dkim`) semantics while enabling `split_key_by_val` reuse.
+
+- Non-goal guardrail:
+  - Do not expand validation semantics (e.g., requiring non-empty `p`, stricter DKIM grammar) during this refactor.
+  - Do not redesign endpoints or response schema.
+  - Do not alter tests except if strictly necessary for internal refactor visibility (current task says preserve existing tests).
 === end findings.md ===
 
 Your job: produce a single markdown design document. Do not write, modify, or move any files; this phase is read-only. You may Read/Glob/Grep further if the findings missed something. Do not run tests or builds.
@@ -86,64 +256,159 @@ Respond with only the document. Structure:
 
 Aim for 100-300 lines. Be specific. The execute phase will follow this plan literally; ambiguity becomes bugs.
 
-=== response (exit 0, duration 15.484s) ===
+=== prior attempt rejected ===
+The reviewer rejected the previous attempt. Address EVERY issue listed below in this new attempt — do not repeat them.
+
+- **Insertion point not specified (criterion 1 — exact insertion points required):** The design says "Add a new private helper in `dkim.py`" but never states where in the file. It must say "insert `_parse_dkim_tokens_and_tags` immediately before `split_key_by_val` at line 28" (or equivalent anchor). Without this, the execute phase can legally place it anywhere, including after the callers, which would be a `NameError` at runtime.
+
+- **kv_pairs tuple accessor not specified (criterion 1 — specificity):** Step 7 defines the tuple as `(raw_key, raw_value, norm_key, norm_value)` — four fields — but steps 19–20 say `is_valid_dkim` should assign `tags[norm_key] = norm_value` without specifying how to unpack or index the tuple. Index access (`kv[2]`, `kv[3]`), positional unpacking, or a namedtuple must be chosen and stated explicitly; leaving it implicit forces the implementer to decide.
+
+- **Dead fields in kv_pairs with no stated purpose (criterion 5 — pick):** `raw_key` and `raw_value` appear in the 4-tuple but no caller step references them. Either state the reason they are included (e.g., "retained for potential future logging parity with `split_key_by_val`") or drop them. A tuple with two unused fields and no rationale is hedging dressed as design.
+=== end prior attempt feedback ===
+
+
+=== response (exit 0, duration 3m43.128s) ===
 # Design
 
 ## Approach
 
-Add a `GET /readyz` route to `dkim.py` that returns `jsonify({"status": "ready"}), 200`, mirroring the existing `/healthz` handler exactly except for the path and status string. Add a new test file `tests/test_readyz.py` that mirrors the structure of `tests/test_healthz.py` with two test methods: one asserting HTTP 200, one asserting the JSON body equals `{"status": "ready"}`.
+Extract one private helper `_parse_dkim_record(record)` into `dkim.py` that performs the whitespace tokenization and semicolon-delimited tag parsing shared by all three functions. The helper returns a 2-tuple `(tokens, tags)`:
+
+- `tokens`: the `list[str]` from `record.split()` — used by `split_key_by_val` for positional access.
+- `tags`: an ordered `list[tuple[str, str]]` of `(key, value)` pairs where `key` is `k.strip().lower()` and `value` is `v.strip()`, derived from `part.partition('=')` on each semicolon-split segment that contains `'='`. — used by `parse_key_type` and `is_valid_dkim`.
+
+Both pieces of data derive from the same initial tokenization pass, so computing them together avoids the redundant `record.split()` calls currently scattered across the three functions. Every caller consumes at least one element of the return value; no dead fields.
+
+Callers unpack with positional syntax: `split_key_by_val` uses `tokens, _ = _parse_dkim_record(key)` (discards tags since it does positional slicing only); `parse_key_type` and `is_valid_dkim` use `_, tags = _parse_dkim_record(record)` (discard tokens since they operate on tag pairs only). Tag pair iteration uses positional unpacking: `for key, value in tags:`.
 
 ## Changes by file
 
-- `dkim.py` — add a `GET /readyz` route handler returning `jsonify({"status": "ready"}), 200`
-- `tests/test_readyz.py` — create new test file with a `TestCase` subclass covering status code and response body
+- **`dkim.py`** — insert `_parse_dkim_record` helper; rewrite bodies of `split_key_by_val`, `parse_key_type`, and `is_valid_dkim` to call it. No other functions touched.
+- **No test files changed.** All existing tests must pass unchanged.
 
 ## Step-by-step plan
 
-1. Open `dkim.py` and locate the `/healthz` route handler (the reference implementation).
-2. Immediately after the `/healthz` handler, insert a new route:
-   ```python
-   @app.route('/readyz', methods=['GET'])
-   def readyz():
-       return jsonify({"status": "ready"}), 200
-   ```
-   No imports need to change — `jsonify` is already imported via `from flask import Flask, request, jsonify` (or equivalent).
-3. Create `tests/test_readyz.py` with the following content, modelled directly on `tests/test_healthz.py`:
-   ```python
-   import json
-   import unittest
-   from dkim import app
+### Step 1 — Insert `_parse_dkim_record` at line 28
 
-   class TestReadyz(unittest.TestCase):
-       def setUp(self):
-           self.client = app.test_client()
+Insert the following function immediately before `split_key_by_val`, which currently starts at line 28. This places the helper above all three callers so it is defined before first use:
 
-       def test_status_code(self):
-           response = self.client.get('/readyz')
-           self.assertEqual(response.status_code, 200)
+```python
+def _parse_dkim_record(record):
+    tokens = record.split()
+    tags = []
+    for token in tokens:
+        for part in token.split(';'):
+            part = part.strip()
+            if '=' in part:
+                k, _, v = part.partition('=')
+                tags.append((k.strip().lower(), v.strip()))
+    return tokens, tags
+```
 
-       def test_response_body(self):
-           response = self.client.get('/readyz')
-           body = json.loads(response.data)
-           self.assertEqual(body, {"status": "ready"})
+Behavioral notes:
+- `record.split()` matches exactly the tokenization used by all three current functions.
+- The inner loop (`token.split(';')` + `strip()`) matches the semicolon splitting in both `parse_key_type` (line 46) and `is_valid_dkim` (line 55).
+- The `'=' in part` guard matches `is_valid_dkim` (line 57). `parse_key_type` checks `tag.lower().startswith('k=')` which implies `=` is present, so this guard excludes the same set of non-tag parts for both callers.
+- `k.strip().lower()` matches `is_valid_dkim` line 59.
+- `v.strip()` matches `is_valid_dkim` line 59.
+- The empty string produced by `token.split(';')` on a trailing semicolon (e.g., `'k=rsa;'` → `['k=rsa', '']`) is stripped to `''`, does not contain `'='`, and is skipped — matching current behavior where `parse_key_type` checks `startswith('k=')` on `''` (no match) and `is_valid_dkim` skips parts without `'='`.
+- Pairs are appended in encounter order (whitespace-token order, then semicolon-split order within each token), preserving the first-match semantics `parse_key_type` relies on and the last-write-wins semantics `is_valid_dkim` relies on when it builds its dict.
 
-   if __name__ == '__main__':
-       unittest.main()
-   ```
-4. Verify the test is discoverable: `python -m unittest discover tests` from the repo root will find any `test_*.py` file, so `test_readyz.py` qualifies automatically.
+### Step 2 — Rewrite `split_key_by_val` (currently lines 28–42)
+
+Replace the body of `split_key_by_val` with:
+
+```python
+def split_key_by_val(key):
+    tokens, _ = _parse_dkim_record(key)
+    name = tokens[0]
+    content_1 = f"{tokens[1]} {tokens[2]}"
+    content_2 = tokens[3]
+    content_3 = tokens[4]
+
+    app.logger.debug('name: %s \n content1: %s \n content2: %s\n content3 %s\n' % (name, content_1, content_2, content_3) )
+
+    split_key_json = {'record1': f"{name} {content_1} {content_2}", 'record2': f"{name} TXT {content_3}"}
+
+    app.logger.debug(split_key_json)
+
+    return split_key_json
+```
+
+Differences from current code:
+- `tokens` replaces five separate `key.split()` calls with one split inside the helper.
+- The debug log lines and string formatting are unchanged — same variables logged, same format strings.
+- The returned dict keys and f-string templates are identical.
+- `IndexError` on fewer than 5 tokens is preserved: `tokens[4]` raises `IndexError` just as `key.split()[4]` does today. The helper itself does not guard token count.
+- `tokens, _` discards the tags list since `split_key_by_val` does no tag-level logic. The underscore signals an intentionally unused return value.
+
+### Step 3 — Rewrite `parse_key_type` (currently lines 44–50)
+
+Replace the body of `parse_key_type` with:
+
+```python
+def parse_key_type(record):
+    _, tags = _parse_dkim_record(record)
+    for key, value in tags:
+        if key == 'k':
+            return value.upper()
+    return 'RSA'  # RFC 6376 §3.3 default
+```
+
+Differences from current code:
+- Replaces manual whitespace → semicolon → `startswith('k=')` scan with iteration over pre-parsed `(key, value)` pairs.
+- `key == 'k'` is equivalent to `tag.lower().startswith('k=')` for parts that contain `=`: the helper already normalizes the key to lowercase and strips it, so `'k'` is the only possible normalized form of a `k` tag name. Parts without `=` are excluded by the helper's guard, matching the implicit exclusion in `startswith('k=')`.
+- `value.upper()` replaces `tag[2:].strip().upper()`. The helper already strips the value, and `tag[2:]` was the portion after `k=` — which is exactly what `partition('=')` returns as `v`.
+- First-match wins: the `for` loop returns on the first pair with `key == 'k'`, matching the current early-return behavior.
+- Default `'RSA'` preserved with the same comment.
+
+### Step 4 — Rewrite `is_valid_dkim` (currently lines 52–60)
+
+Replace the body of `is_valid_dkim` with:
+
+```python
+def is_valid_dkim(record):
+    _, tags = _parse_dkim_record(record)
+    tag_map = {}
+    for key, value in tags:
+        tag_map[key] = value
+    return tag_map.get('v', '').upper() == 'DKIM1' and 'p' in tag_map
+```
+
+Differences from current code:
+- Replaces manual token/semicolon/`partition` loop with iteration over pre-parsed tag pairs.
+- `tag_map[key] = value` in encounter order produces last-write-wins semantics, identical to the current `tags[key.strip().lower()] = val.strip()` dict assignment.
+- The validation condition is character-for-character the same logic, operating on `tag_map` instead of `tags`.
+- `p=` (empty value) still produces `('p', '')` in the pairs, which becomes `'p': ''` in the dict, so `'p' in tag_map` is `True` — matching current revoked-key-is-valid behavior.
+- `v=dkim1` (lowercase) still normalizes to `('v', 'dkim1')`, and `tag_map.get('v', '').upper()` produces `'DKIM1'` — matching current case-insensitive check.
+
+### Step 5 — No changes to endpoints or other functions
+
+Lines 62–98 (endpoints, `healthz`, `readyz`, `__main__`) are not modified. They call the three functions by name and will pick up the refactored bodies transparently.
 
 ## Test plan
 
-- **Existing tests**: `tests/test_healthz.py` and `tests/test_split_key_by_val.py` must continue to pass unchanged — the new route does not touch any existing handler.
-- **New tests in `tests/test_readyz.py`**:
-  - `test_status_code` — GET `/readyz` returns HTTP 200
-  - `test_response_body` — GET `/readyz` returns JSON body exactly equal to `{"status": "ready"}`
-- Run all tests with `python -m unittest discover tests` from the repo root to confirm nothing regresses.
+All existing tests pass unchanged — no test modifications:
+
+| Test file | What it covers | Why it still passes |
+|---|---|---|
+| `tests/test_split_key_by_val.py` | Exact string output of `split_key_by_val` for canonical input | `tokens` come from the same `record.split()`; f-string templates are identical |
+| `tests/test_dkim_key_type.py` | `/dkim_key_type` endpoint — explicit `k=rsa`, missing `k`, missing payload | `parse_key_type` returns same values; endpoint unchanged |
+| `tests/test_validate_dkim.py` | `/validate_dkim` endpoint — valid, missing `v`, missing `p`, revoked `p=`, missing payload | `is_valid_dkim` produces same boolean; endpoint unchanged |
+| `tests/test_healthz.py` | `/healthz` GET | No parsing code touched |
+| `tests/test_readyz.py` | `/readyz` GET | No parsing code touched |
+
+No new tests are required. The refactor is purely internal; the behavioral contract is fully covered by existing tests.
 
 ## Risks and open questions
 
-- **Flask import line**: The execute phase must confirm the exact existing import line in `dkim.py` (e.g., `from flask import Flask, request, jsonify`) to ensure `jsonify` is already imported and no import change is needed. If `jsonify` is not imported, add it.
-- **Placement of new route**: Inserting after `/healthz` is the most logical location; the execute phase should confirm the end of the `/healthz` handler to find the exact insertion point without disrupting surrounding code.
-- **No `__init__.py` in `tests/`**: Confirmed by findings — do not add one; it is not needed and could break relative imports elsewhere.
-- **CI runner**: The findings note no `pytest.ini` or CI config is visible. The `if __name__ == '__main__': unittest.main()` guard in the new file is harmless but not required; it is included for consistency with potential future direct invocation.
+- **Whitespace normalization**: The helper uses `record.split()` which matches all three current functions. Any input where `split()` behavior differs from expectations (e.g., non-breaking spaces, tabs) was already handled identically by the current code. No change.
+
+- **Traversal order for duplicate tags**: `parse_key_type` returns the first `k` tag; `is_valid_dkim` uses the last value for any duplicated tag. Both semantics are preserved because the helper returns pairs in encounter order and each caller applies its own strategy (early return vs. dict overwrite). No open question.
+
+- **Logging in `split_key_by_val`**: The two `app.logger.debug` calls log the same intermediate variables (`name`, `content_1`, `content_2`, `content_3`, `split_key_json`) with the same format strings. Log output is identical. Tests do not assert on logs, but operational debugging is unaffected.
+
+- **Exception behavior**: `split_key_by_val` will still raise `IndexError` on inputs with fewer than 5 whitespace tokens because `tokens[4]` indexes into the list returned by the helper's `record.split()`. The helper itself performs no bounds checking. This matches current behavior exactly.
+
+- **No open questions remain**. The helper's return shape is specified (2-tuple of `list[str]` and `list[tuple[str, str]]`), unpacking syntax is specified (positional), and all fields are consumed by at least one caller.
 
